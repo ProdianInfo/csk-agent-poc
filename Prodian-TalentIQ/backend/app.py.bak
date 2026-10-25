@@ -1,0 +1,452 @@
+"""Prodian TalentIQ v0.1: local-first ATS and observable TELA integration lab.
+Run `uvicorn backend.app:app --host 127.0.0.1 --port 8091` from repository root.
+NOT production-ready: see docs/SECURITY_PRIVACY.md.
+"""
+import csv
+import hashlib
+import hmac
+import io
+import json
+import logging
+import os
+import secrets
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Annotated
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Response, Depends, Query
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from pydantic import BaseModel, Field
+
+from .db import initialize, connect, rows, one
+from .matcher import rank_candidate, split_skills, detect_skills
+from .parser import parse_candidate, ParseError, SUPPORTED
+
+ROOT=Path(__file__).resolve().parents[1]
+WEB=ROOT/'web'
+UPLOADS=ROOT/'data'/'resumes'
+UPLOADS.mkdir(parents=True,exist_ok=True)
+DEMO_PASSWORD=os.getenv('TALENTIQ_DEMO_PASSWORD','LocalDemo#2026')
+APP_SECRET=os.getenv('TALENTIQ_SESSION_SECRET','local-unsafe-change-before-sharing')
+TELA_KEY=os.getenv('TALENTIQ_TELA_KEY','')
+MAX_UPLOAD=int(os.getenv('TALENTIQ_MAX_UPLOAD_MB','10'))*1024*1024
+MAX_BATCH=80
+serializer=URLSafeTimedSerializer(APP_SECRET,salt='talentiq-demo-session')
+logger=logging.getLogger('talentiq')
+logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
+app=FastAPI(title='Prodian TalentIQ',description='POC candidate intelligence and TELA integration',version='0.1.0')
+initialize()
+
+# All accounts are intentionally local demo identities; use SSO for real candidates.
+ACCOUNTS={'admin':'admin','hr':'hr','lead':'lead'}
+
+def current_user(request:Request):
+    token=request.cookies.get('talentiq_session','')
+    try:
+        item=serializer.loads(token,max_age=8*3600)
+        if item.get('user') in ACCOUNTS:return item
+    except (BadSignature,SignatureExpired):pass
+    raise HTTPException(401,'Please sign in')
+
+def hr(user=Depends(current_user)):
+    if user['role'] not in ('hr','admin'): raise HTTPException(403,'HR authorization required')
+    return user
+
+def admin(user=Depends(current_user)):
+    if user['role']!='admin': raise HTTPException(403,'Administrator authorization required')
+    return user
+
+def audit(actor,action,resource,detail=''):
+    with connect() as con: con.execute('INSERT INTO audit(actor,action,resource,detail) VALUES(?,?,?,?)',
+        (actor,action,resource,str(detail)[:500]))
+
+def as_candidate(c,role):
+    c=dict(c)
+    c['skills']=split_skills(c.get('skills',''))
+    if role not in ('admin','hr'):
+        c['email']='[restricted]';c['phone']='[restricted]';c['extracted_text']=''
+    c.pop('resume_hash',None)
+    c.pop('resume_file',None)
+    return c
+
+def actor_label(user): return user.get('user','system')
+
+def enforce_origin(request):
+    origin=request.headers.get('origin','')
+    if origin:
+        from urllib.parse import urlparse
+        parsed=urlparse(origin)
+        host=request.headers.get('host','')
+        if parsed.netloc != host:raise HTTPException(403,'Origin mismatch')
+
+@app.middleware('http')
+async def trace_middleware(request,call_next):
+    start=time.perf_counter();tid=request.headers.get('x-request-id') or str(uuid.uuid4())
+    try: response=await call_next(request)
+    except Exception:
+        logger.exception('server_error trace=%s path=%s',tid,request.url.path)
+        response=JSONResponse({'detail':'Internal error','trace_id':tid},status_code=500)
+    response.headers['X-Request-ID']=tid
+    response.headers['X-Content-Type-Options']='nosniff'
+    response.headers['Referrer-Policy']='no-referrer'
+    response.headers['Cache-Control']='no-store'
+    logger.info('request trace=%s method=%s path=%s status=%s ms=%.1f',
+      tid,request.method,request.url.path,response.status_code,(time.perf_counter()-start)*1000)
+    return response
+
+class Login(BaseModel):
+    username:str
+    password:str
+@app.post('/api/auth/login')
+def login(body:Login, response:Response,request:Request):
+    enforce_origin(request)
+    key=body.username.lower().strip()
+    if key not in ACCOUNTS or not hmac.compare_digest(body.password,DEMO_PASSWORD):
+        raise HTTPException(401,'Incorrect demo credentials')
+    token=serializer.dumps({'user':key,'role':ACCOUNTS[key]})
+    response.set_cookie('talentiq_session',token,httponly=True,samesite='strict',secure=os.getenv('TALENTIQ_COOKIE_SECURE','false').lower()=='true',max_age=28800)
+    audit(key,'login','auth')
+    return {'username':key,'role':ACCOUNTS[key]}
+@app.get('/api/auth/me')
+def me(user=Depends(current_user)):return {'username':user['user'],'role':user['role']}
+@app.post('/api/auth/logout')
+def logout(response:Response,user=Depends(current_user)):
+    response.delete_cookie('talentiq_session');return {'ok':True}
+
+class CandidateInput(BaseModel):
+    name:str=Field(min_length=2,max_length=160)
+    email:str=''
+    phone:str=''
+    years:float=Field(ge=0,le=60,default=0)
+    skills:str=''
+    location:str=''
+    availability:str='30 days'
+    status:str='New'
+
+@app.get('/api/dashboard')
+def dashboard(user=Depends(current_user)):
+    with connect() as con:
+        total=con.execute('SELECT COUNT(*) FROM candidates').fetchone()[0]
+        jobs=con.execute("SELECT COUNT(*) FROM jobs WHERE status='Open'").fetchone()[0]
+        shortlisted=con.execute("SELECT COUNT(*) FROM candidates WHERE status='Shortlisted'").fetchone()[0]
+        interviews=con.execute("SELECT COUNT(*) FROM candidates WHERE status='Interview'").fetchone()[0]
+        imports=rows(con,'SELECT id,filename,source,result,detail,method,created_at FROM imports ORDER BY id DESC LIMIT 5')
+        top=[{'skill':s,'count':0} for s in ['Java','Spring Boot','React','Python','Azure','QA','PostgreSQL']]
+        for x in rows(con,'SELECT skills FROM candidates'):
+            skills=set(split_skills(x['skills']))
+            for item in top:
+                if item['skill'] in skills:item['count']+=1
+        return {'total_candidates':total,'open_jobs':jobs,'shortlisted':shortlisted,
+              'interviews':interviews,'imports':imports,'skill_distribution':top,
+              'synthetic':all(x['source']=='synthetic' for x in rows(con,'SELECT source FROM candidates'))}
+
+@app.get('/api/candidates')
+def list_candidates(q:str='',skills:str='',min_years:float=0,max_years:float|None=None,
+                    location:str='',available_only:bool=False,limit:int=Query(100,ge=1,le=500),
+                    user=Depends(current_user)):
+    with connect() as con:
+        values=rows(con,'SELECT * FROM candidates ORDER BY id DESC LIMIT 2000')
+    if q:
+        parts=q.lower().split()
+        values=[v for v in values if all(k in (' '.join([v['name'],v['skills'],v['location'],v['email'],str(v['years'])])).lower() for k in parts)]
+    if skills or min_years or location or max_years:
+        out=[]
+        for v in values:
+            x=rank_candidate(v,skills,min_years,max_years,location,available_only)
+            if skills and not x['matched_skills']:continue
+            if available_only and not x['availability_fit']:continue
+            out.append({**as_candidate(v,user['role']),**x})
+        out.sort(key=lambda x:(x['score'],x['years']),reverse=True)
+    else:
+        out=[{**as_candidate(v,user['role']),**rank_candidate(v,[],0), 'score':None} for v in values]
+        if available_only:out=[v for v in out if v['availability'].lower() in ('immediate','0 days')]
+    return {'total':len(out),'items':out[:limit],'scoring':'65% skills · 20% experience · 10% location · 5% availability; explainable heuristic, not hiring decision'}
+
+@app.post('/api/candidates')
+def create_candidate(body:CandidateInput,user=Depends(hr)):
+    with connect() as con:
+        if body.email and one(con,'SELECT id FROM candidates WHERE lower(email)=lower(?)',(body.email,)):
+            raise HTTPException(409,'A candidate with this email already exists')
+        cur=con.execute('''INSERT INTO candidates(name,email,phone,years,skills,location,availability,status,source)
+             VALUES(?,?,?,?,?,?,?,?,?)''',
+             (body.name,body.email,body.phone,body.years,', '.join(split_skills(body.skills)),
+              body.location,body.availability,body.status,'manual'))
+        id=cur.lastrowid
+    audit(actor_label(user),'create_candidate',str(id))
+    return {'id':id}
+
+@app.get('/api/candidates/{candidate_id}')
+def get_candidate(candidate_id:int,user=Depends(current_user)):
+    with connect() as con:c=one(con,'SELECT * FROM candidates WHERE id=?',(candidate_id,))
+    if not c:raise HTTPException(404,'Candidate not found')
+    if user['role'] in ('hr','admin'):audit(actor_label(user),'view_candidate',str(candidate_id))
+    return as_candidate(c,user['role'])
+
+class Stage(BaseModel):status:str
+STAGES=('New','Shortlisted','Interview','Selected','Rejected','On Hold')
+@app.patch('/api/candidates/{candidate_id}/stage')
+def update_stage(candidate_id:int,body:Stage,user=Depends(hr)):
+    if body.status not in STAGES:raise HTTPException(422,'Invalid stage')
+    with connect() as con:
+        res=con.execute('UPDATE candidates SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?',(body.status,candidate_id))
+        if not res.rowcount:raise HTTPException(404,'Candidate not found')
+    audit(actor_label(user),'update_stage',str(candidate_id),body.status)
+    return {'ok':True,'status':body.status}
+
+@app.get('/api/candidates/{candidate_id}/resume')
+def download_resume(candidate_id:int,user=Depends(hr)):
+    with connect() as con:c=one(con,'SELECT resume_file FROM candidates WHERE id=?',(candidate_id,))
+    if not c or not c['resume_file']:raise HTTPException(404,'No resume available')
+    f=UPLOADS/Path(c['resume_file']).name
+    if not f.is_file():raise HTTPException(404,'Resume not found on disk')
+    audit(actor_label(user),'download_resume',str(candidate_id))
+    return FileResponse(f,filename=f.name,media_type='application/octet-stream')
+
+class JobInput(BaseModel):
+    title:str=Field(min_length=3,max_length=180)
+    skills:str=''
+    min_years:float=Field(ge=0,le=60,default=0)
+    max_years:float|None=None
+    location:str=''
+    description:str=''
+@app.get('/api/jobs')
+def jobs(user=Depends(current_user)):
+    with connect() as con:return {'items':rows(con,'SELECT * FROM jobs ORDER BY id DESC')}
+@app.post('/api/jobs')
+def add_job(body:JobInput,user=Depends(hr)):
+    with connect() as con:
+        cur=con.execute('INSERT INTO jobs(title,skills,min_years,max_years,location,description) VALUES(?,?,?,?,?,?)',
+          (body.title,', '.join(split_skills(body.skills)),body.min_years,body.max_years,body.location,body.description))
+        id=cur.lastrowid
+    audit(actor_label(user),'create_job',str(id));return {'id':id}
+@app.get('/api/jobs/{job_id}/matches')
+def job_matches(job_id: int, user=Depends(current_user)):
+    with connect() as con:
+        job = one(con, 'SELECT * FROM jobs WHERE id=?', (job_id,))
+
+    if not job:
+        raise HTTPException(404, 'Job not found')
+
+    return list_candidates(
+        skills=job['skills'],
+        min_years=job['min_years'],
+        max_years=job['max_years'],
+        location=job['location'],
+        limit=100,
+        user=user
+    )
+
+async def ingest_uploaded(file:UploadFile,actor:str):
+    fname=Path(file.filename or 'unnamed').name[:150]
+    ext=Path(fname).suffix.lower()
+    if ext not in SUPPORTED:raise ParseError('Unsupported type; use PDF, DOCX, DOC, JPG, PNG, TXT, CSV')
+    raw=await file.read(MAX_UPLOAD+1)
+    if not raw:raise ParseError('Empty file')
+    if len(raw)>MAX_UPLOAD:raise ParseError('File exceeds upload size limit')
+    digest=hashlib.sha256(raw).hexdigest()
+    if ext=='.csv':
+        items=[]
+        reader=csv.DictReader(io.StringIO(raw.decode('utf-8-sig')))
+        if not reader.fieldnames or 'name' not in reader.fieldnames:raise ParseError('CSV requires name header')
+        with connect() as con:
+            for row in list(reader)[:300]:
+                name=(row.get('name') or '').strip()
+                if not name:continue
+                email=(row.get('email') or '').strip()
+                if email and one(con,'SELECT id FROM candidates WHERE lower(email)=lower(?)',(email,)):
+                    items.append({'name':name,'result':'duplicate'});continue
+                try: years=float(row.get('years') or 0)
+                except ValueError: years=0
+                cur=con.execute('''INSERT INTO candidates(name,email,phone,years,skills,location,availability,status,source,parse_method,review_needed)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?)''',(name,email,row.get('phone',''),years,
+                    ', '.join(split_skills(row.get('skills',''))),row.get('location',''),row.get('availability','30 days'),
+                    'New','csv','csv',1))
+                items.append({'id':cur.lastrowid,'name':name,'result':'imported'})
+        audit(actor,'bulk_csv_import','candidates',f'{len(items)} rows')
+        return {'filename':fname,'result':'imported','method':'csv','count':len(items),'rows':items[:10]}
+    with connect() as con:
+        if one(con,'SELECT id FROM candidates WHERE resume_hash=?',(digest,)):
+            raise ParseError('Duplicate resume: identical file already imported')
+    data=parse_candidate(fname,raw)
+    with connect() as con:
+        if data['email'] and one(con,'SELECT id FROM candidates WHERE lower(email)=lower(?)',(data['email'],)):
+            raise ParseError('Duplicate: email address already exists. Review existing profile.')
+        stored=str(uuid.uuid4())+ext
+        (UPLOADS/stored).write_bytes(raw)
+        cur=con.execute('''INSERT INTO candidates(name,email,phone,years,skills,source,
+             resume_file,resume_hash,parse_method,review_needed,extracted_text)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
+             (data['name'],data['email'],data['phone'],data['years'],', '.join(data['skills']),
+              'resume',stored,digest,data['parse_method'],1,data['extracted_text']))
+        id=cur.lastrowid
+    audit(actor,'import_resume',str(id),data['parse_method'])
+    return {'filename':fname,'result':'imported','id':id,'name':data['name'],
+         'method':data['parse_method'],'skills':data['skills'],'warnings':data['warnings']}
+
+@app.post('/api/imports/upload')
+async def upload_files(files:list[UploadFile]=File(...),user=Depends(hr)):
+    if len(files)>MAX_BATCH:raise HTTPException(413,'Maximum 80 resumes per batch')
+    results=[]
+    for f in files:
+        try: result=await ingest_uploaded(f,actor_label(user))
+        except Exception as ex:
+            # File input errors may be surfaced but not printed with PII.
+            result={'filename':Path(f.filename or 'unknown').name,'result':'failed','detail':str(ex)[:240]}
+        results.append(result)
+        with connect() as con:
+            con.execute('INSERT INTO imports(filename,source,result,detail,method,candidate_id) VALUES(?,?,?,?,?,?)',
+             (result['filename'],'web-folder-or-upload',result['result'],result.get('detail',''),
+              result.get('method',''),result.get('id')))
+    return {'total':len(results),'imported':sum(x['result']=='imported' for x in results),
+        'failed':sum(x['result']=='failed' for x in results),'items':results}
+
+@app.get('/api/imports')
+def import_history(user=Depends(hr)):
+    with connect() as con:return {'items':rows(con,'SELECT * FROM imports ORDER BY id DESC LIMIT 150')}
+
+@app.get('/api/pipeline')
+def pipeline(user=Depends(current_user)):
+    with connect() as con:
+        allc=rows(con,'SELECT id,name,years,skills,status,location FROM candidates ORDER BY id DESC LIMIT 200')
+    return {'stages':{stage:[{**x,'skills':split_skills(x['skills'])} for x in allc if x['status']==stage] for stage in STAGES}}
+
+@app.get('/api/ops/health')
+def health():return {'status':'ok','app':'Prodian TalentIQ','version':'0.1.0','ocr':'pytesseract (when installed)','mode':'LOCAL DEMO'}
+
+DEPENDENCIES={'candidate_search':{'api':['GET /api/candidates','GET /api/jobs/{id}/matches'],
+   'modules':['backend.matcher','backend.db','web.app'],
+   'tables':['candidates','jobs'],'business_impact':'Recruiters cannot shortlist profiles'},
+ 'resume_import':{'api':['POST /api/imports/upload'],
+   'modules':['backend.parser','backend.app','backend.db'],
+   'tables':['candidates','imports'],'business_impact':'HR cannot onboard resumes'},
+ 'pipeline':{'api':['PATCH /api/candidates/{id}/stage','GET /api/pipeline'],
+   'modules':['backend.app','backend.db'],'tables':['candidates','audit'],
+   'business_impact':'Interview lifecycle cannot be updated'}}
+
+@app.get('/api/ops/dependency-map')
+def dependency_map(user=Depends(current_user)):return DEPENDENCIES
+
+FAULTS={'resume_parser_error':('Resume OCR extraction failure','high','resume_import'),
+        'search_500':('Candidate search HTTP 500','critical','candidate_search'),
+        'search_latency':('Candidate search latency exceeds SLO','medium','candidate_search'),
+        'schema_drift':('Candidate skills column mismatch','high','candidate_search')}
+class FaultInput(BaseModel):kind:str
+@app.post('/api/ops/inject')
+def inject_fault(body:FaultInput,user=Depends(admin)):
+    if os.getenv('TALENTIQ_LAB_MODE','true').lower()!='true':raise HTTPException(403,'Lab mode disabled')
+    if body.kind not in FAULTS:raise HTTPException(422,'Unknown lab fault')
+    title,severity,module=FAULTS[body.kind]
+    trace=str(uuid.uuid4())
+    details={'fault':body.kind,'component':module,'affected':DEPENDENCIES[module],
+       'evidence':'LAB_INJECTED; synthetic test incident, not actual production failure'}
+    with connect() as con:
+        cur=con.execute('INSERT INTO incidents(kind,title,severity,trace_id,details) VALUES(?,?,?,?,?)',
+          (body.kind,title,severity,trace,json.dumps(details)))
+        id=cur.lastrowid
+    logger.error('lab_fault trace=%s incident_id=%s kind=%s component=%s',trace,id,body.kind,module)
+    audit(actor_label(user),'inject_lab_fault',str(id),body.kind)
+    return {'id':id,'trace_id':trace,'title':title,'simulation':True}
+
+@app.post('/api/ops/lab/reproduce')
+def reproduce_lab_failure(body:FaultInput,user=Depends(admin)):
+    """Real HTTP test response on isolated lab route; never breaks live HR endpoints."""
+    if os.getenv('TALENTIQ_LAB_MODE','true').lower()!='true':raise HTTPException(403,'Lab mode disabled')
+    if body.kind not in FAULTS:raise HTTPException(422,'Unknown fault')
+    trace=str(uuid.uuid4())
+    logger.error('LAB_REPRODUCED trace=%s kind=%s isolated_endpoint=ops/lab/reproduce',trace,body.kind)
+    if body.kind=='search_latency':
+        time.sleep(1.2)
+        return JSONResponse({'lab':True,'kind':body.kind,'simulated_latency_ms':1200,'trace_id':trace},
+            headers={'X-Lab-Trace-ID':trace})
+    if body.kind=='resume_parser_error':
+        return JSONResponse({'lab':True,'error':'Simulated OCR engine unavailable','trace_id':trace},
+            status_code=422,headers={'X-Lab-Trace-ID':trace})
+    return JSONResponse({'lab':True,'error':'Simulated '+body.kind+' on isolated lab route','trace_id':trace},
+         status_code=500,headers={'X-Lab-Trace-ID':trace})
+
+@app.get('/api/ops/incidents')
+def incidents(user=Depends(current_user)):
+    with connect() as con:return {'items':rows(con,'SELECT * FROM incidents ORDER BY id DESC LIMIT 100')}
+@app.get('/api/ops/audit')
+def audits(user=Depends(admin)):
+    with connect() as con:return {'items':rows(con,'SELECT * FROM audit ORDER BY id DESC LIMIT 100')}
+
+class ApprovalRequest(BaseModel):incident_id:int
+@app.post('/api/ops/reprocess/prepare')
+def prepare_reprocess(body:ApprovalRequest,user=Depends(hr)):
+    with connect() as con:
+        if not one(con,'SELECT id FROM incidents WHERE id=?',(body.incident_id,)):
+            raise HTTPException(404,'Incident not found')
+        cur=con.execute('INSERT INTO approvals(action,target_id,requested_by) VALUES(?,?,?)',
+            ('mark_incident_resolved',body.incident_id,actor_label(user)))
+        id=cur.lastrowid
+    audit(actor_label(user),'request_resolution_approval',str(id))
+    return {'approval_id':id,'status':'pending','action':'mark_incident_resolved'}
+@app.post('/api/ops/reprocess/{approval_id}/approve')
+def approve(approval_id:int,user=Depends(admin)):
+    with connect() as con:
+        item=one(con,'SELECT * FROM approvals WHERE id=?',(approval_id,))
+        if not item or item['status']!='pending':raise HTTPException(409,'Approval not pending')
+        if item['requested_by']==user['user']:raise HTTPException(403,'Four-eyes approval: requester cannot self-approve')
+        con.execute("UPDATE approvals SET status='approved',approved_by=? WHERE id=?",(actor_label(user),approval_id))
+    audit(actor_label(user),'approve_resolution',str(approval_id))
+    return {'status':'approved'}
+@app.post('/api/ops/reprocess/{approval_id}/execute')
+def execute_reprocess(approval_id:int,user=Depends(admin)):
+    with connect() as con:
+        item=one(con,'SELECT * FROM approvals WHERE id=?',(approval_id,))
+        if not item or item['status']!='approved' or item['action']!='mark_incident_resolved':
+            raise HTTPException(403,'Approved action required')
+        con.execute("UPDATE incidents SET status='resolved' WHERE id=?",(item['target_id'],))
+        con.execute("UPDATE approvals SET status='executed' WHERE id=?",(approval_id,))
+    audit(actor_label(user),'execute_approved_resolution',str(approval_id))
+    return {'status':'executed','effect':'Synthetic incident status changed to resolved; no operational retry performed'}
+
+# TELA tool gateway: deliberately explicit authorization, never implicit TELA access to DB.
+def tela_auth(request:Request):
+    supplied=request.headers.get('x-tela-service-key','')
+    if not TELA_KEY or not hmac.compare_digest(supplied,TELA_KEY):
+        raise HTTPException(403,'TELA service key not configured or invalid')
+    return True
+class CandidateSearchTool(BaseModel):
+    skills:str=''
+    min_years:float=0
+    max_years:float|None=None
+    location:str=''
+    limit:int=Field(default=10,ge=1,le=25)
+@app.post('/api/tela/tools/search-candidates')
+def tela_candidate_search(body:CandidateSearchTool,ok=Depends(tela_auth)):
+    # Tool is redacted by default: PII should NOT be sent to the LLM.
+    with connect() as con: values=rows(con,'SELECT * FROM candidates ORDER BY id DESC LIMIT 2000')
+    output=[]
+    for c in values:
+        match=rank_candidate(c,body.skills,body.min_years,body.max_years,body.location)
+        if body.skills and not match['matched_skills']:continue
+        output.append({'candidate_id':c['id'],'candidate_ref':f"TQ-{c['id']:05d}",
+          'years':c['years'],'skills':split_skills(c['skills']),
+          'location':c['location'],'status':c['status'],**match})
+    output.sort(key=lambda x:x['score'],reverse=True)
+    audit('tela-service','candidate_search_tool','read-only',f'{min(body.limit,len(output))} results')
+    return {'items':output[:body.limit],'pii_policy':'name, phone and email intentionally excluded; resolve in TalentIQ HR UI'}
+@app.get('/api/tela/tools/application-map')
+def tela_appmap(ok=Depends(tela_auth)):
+    return {'application':'Prodian TalentIQ','capabilities':['resume_ingestion','ocr','search','ranking','pipeline'],
+       'modules':DEPENDENCIES,'read_only_tools':['search-candidates','application-map'],
+       'limitations':['No live TELA binding supplied','No autonomous unrestricted remediation']}
+
+@app.get('/api/form-definitions/candidate-search')
+def candidate_search_form(user=Depends(current_user)):
+    return {'form':'CandidateSearch','version':1,'method':'GET','api':'/api/candidates',
+       'fields':[{'name':'skills','label':'Required skills','type':'text'},
+         {'name':'min_years','label':'Minimum years','type':'number','min':0},
+         {'name':'max_years','label':'Maximum years','type':'number','min':0},
+         {'name':'location','label':'Location','type':'text'}],
+       'requires_approval_for_write':True,'source':'TalentIQ static schema; proposed as TELA Assist dynamic form reference'}
+
+app.mount('/assets',StaticFiles(directory=WEB),name='assets')
+@app.get('/')
+def home():return FileResponse(WEB/'index.html')

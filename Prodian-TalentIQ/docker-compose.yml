@@ -1,0 +1,17 @@
+services:
+  talentiq:
+    build: .
+    container_name: prodian-talentiq-poc
+    ports:
+      - '127.0.0.1:8091:8091'
+    environment:
+      TALENTIQ_SESSION_SECRET: ${TALENTIQ_SESSION_SECRET:?set in .env}
+      TALENTIQ_DEMO_PASSWORD: ${TALENTIQ_DEMO_PASSWORD:?set in .env}
+      TALENTIQ_TELA_KEY: ${TALENTIQ_TELA_KEY:-}
+      TALENTIQ_LAB_MODE: 'true'
+      TALENTIQ_DB_PATH: /app/data/talentiq.sqlite3
+    volumes:
+      - talentiq_data:/app/data
+    restart: unless-stopped
+volumes:
+  talentiq_data:

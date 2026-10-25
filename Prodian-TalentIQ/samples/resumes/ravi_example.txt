@@ -1,0 +1,7 @@
+SYNTHETIC CANDIDATE PROFILE
+Ravi Example
+ravi.example@example.invalid
+Total Experience: 5 years
+Skills: Java, Spring Boot, PostgreSQL, REST API, Azure, Docker
+Location: Chennai
+This sample contains NO real candidate contact information.

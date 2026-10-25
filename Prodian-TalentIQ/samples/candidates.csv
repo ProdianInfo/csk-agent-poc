@@ -1,0 +1,4 @@
+name,email,phone,years,skills,location,availability
+Synthetic Java Applicant,java.sample@example.invalid,0000000000,5,"Java, Spring Boot, PostgreSQL, REST API",Chennai,Immediate
+Synthetic React Applicant,react.sample@example.invalid,0000000000,3,"React, TypeScript, JavaScript",Bengaluru,30 days
+Synthetic Python Applicant,python.sample@example.invalid,0000000000,6,"Python, FastAPI, Azure, RAG",Chennai,15 days

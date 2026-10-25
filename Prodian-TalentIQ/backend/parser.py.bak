@@ -1,0 +1,88 @@
+"""Resume extraction: selectable PDF, scanned PDF OCR, DOCX, images, TXT, CSV."""
+import io
+import os
+import re
+import tempfile
+from pathlib import Path
+from .matcher import detect_skills
+
+SUPPORTED = {'.pdf','.docx','.doc','.txt','.png','.jpg','.jpeg','.tif','.tiff','.csv'}
+
+class ParseError(Exception): pass
+
+def extract_document(filename, raw):
+    ext = Path(filename).suffix.lower()
+    if ext not in SUPPORTED: raise ParseError(f'Unsupported file type: {ext}')
+    if ext == '.csv': return raw.decode('utf-8-sig',errors='replace'), 'csv'
+    if ext == '.txt': return raw.decode('utf-8-sig',errors='replace'), 'text'
+    if ext == '.docx':
+        from docx import Document
+        d = Document(io.BytesIO(raw))
+        parts=[p.text for p in d.paragraphs]
+        for table in d.tables:
+            for row in table.rows: parts.append(' | '.join(c.text for c in row.cells))
+        text='\n'.join(parts).strip()
+        return text,'docx'
+    if ext == '.doc':
+        # Only when explicitly installed; conversion is isolated to a temp folder.
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            source=Path(td)/'resume.doc'; source.write_bytes(raw)
+            try:
+                res=subprocess.run(['libreoffice','-env:UserInstallation=file://'+td+'/lo-profile',
+                    '--headless','--convert-to','docx','--outdir',td,str(source)],
+                    capture_output=True,timeout=35,check=False)
+                converted=Path(td)/'resume.docx'
+                if not converted.exists(): raise ParseError('Legacy .doc conversion failed; install LibreOffice or save as DOCX')
+                return extract_document('resume.docx',converted.read_bytes())
+            except FileNotFoundError:
+                raise ParseError('Install LibreOffice for legacy .doc files, or convert to DOCX')
+            except subprocess.TimeoutExpired:
+                raise ParseError('Legacy .doc conversion timed out')
+    if ext == '.pdf':
+        from pypdf import PdfReader
+        try:
+            reader=PdfReader(io.BytesIO(raw),strict=False)
+            if len(reader.pages) > 30: raise ParseError('PDF exceeds 30-page limit')
+            text='\n'.join(page.extract_text() or '' for page in reader.pages)
+        except ParseError: raise
+        except Exception as exc: raise ParseError(f'Cannot open PDF: {exc}')
+        if len(text.strip()) >= 80: return text,'pdf-text'
+        try:
+            import fitz, pytesseract
+            from PIL import Image
+            doc=fitz.open(stream=raw,filetype='pdf')
+            ocr=[]
+            for page in list(doc)[:12]:
+                pix=page.get_pixmap(matrix=fitz.Matrix(1.7,1.7),alpha=False)
+                im=Image.open(io.BytesIO(pix.tobytes('png')))
+                ocr.append(pytesseract.image_to_string(im,config='--psm 3',timeout=25))
+            return '\n'.join(ocr),'pdf-ocr'
+        except Exception as exc: raise ParseError('OCR failed. Install Tesseract and PyMuPDF: '+str(exc))
+    try:
+        import pytesseract
+        from PIL import Image
+        image=Image.open(io.BytesIO(raw))
+        if image.width*image.height > 25_000_000: raise ParseError('Image too large for OCR')
+        return pytesseract.image_to_string(image,timeout=30),'image-ocr'
+    except ParseError: raise
+    except Exception as exc: raise ParseError('Image OCR failed: '+str(exc))
+
+def parse_candidate(filename, raw):
+    text,method=extract_document(filename,raw)
+    if not text.strip(): raise ParseError('No readable text detected; manual review required')
+    lines=[s.strip() for s in text.splitlines() if s.strip()]
+    email_match=re.search(r'\b[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}\b',text,re.I)
+    phone_match=re.search(r'(?<!\d)(?:\+91[\s-]?)?[6-9]\d{4}[\s-]?\d{5}(?!\d)',text)
+    yrs=re.search(r'(?:total\s+experience\s*[:\-]?\s*)?(\d{1,2})(?:\.\d)?\s*\+?\s*(?:years|yrs)(?:\s+of\s+experience)?',text,re.I)
+    # Name inference is tentative: HR must review.
+    name=Path(filename).stem.replace('_',' ').replace('-',' ')
+    for line in lines[:7]:
+        if len(line)<55 and re.match(r'^[A-Za-z .\-]{4,55}$',line) and not re.search(r'resume|curriculum|profile|summary|developer|engineer|experience',line,re.I):
+            name=line; break
+    return {'name':name.strip().title(),'email':email_match.group() if email_match else '',
+       'phone':re.sub(r'\s+','',phone_match.group()) if phone_match else '',
+       'years':int(yrs.group(1)) if yrs else 0,'skills':detect_skills(text),
+       'extracted_text':text[:100000],'parse_method':method,'review_needed':True,
+       'warnings':[x for x,needed in [('Email missing',not email_match),
+           ('Phone missing',not phone_match),('Experience unverified',not yrs)] if needed]}
